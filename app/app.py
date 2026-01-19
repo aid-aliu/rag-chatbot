@@ -1,30 +1,57 @@
-import streamlit as st
-import sys
 import os
+import sys
 import time
+from pathlib import Path
 
-# Ensure 'rag' module is accessible
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from rag.retrieval import get_vector_store, search_docs, build_context, format_source_line
-from rag.prompting import get_llm, generate_answer, contextualize_question, looks_like_prompt_injection, IDK_RESPONSE
+import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage
 
-# Import the dashboard component
-from dashboard import render_dashboard
+# --- 1. SECRETS SETUP (CRITICAL FOR CLOUD DEPLOYMENT) ---
+# We use a try-except block because st.secrets crashes if no secrets.toml exists (like on your local PC).
+# This allows the app to work locally (using your .env file) AND on the cloud (using st.secrets).
+try:
+    if "OPENAI_API_KEY" in st.secrets:
+        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+except FileNotFoundError:
+    # This happens when running locally without a secrets.toml file.
+    # We pass silently because the .env file will be loaded later by the rag module.
+    pass
+except Exception:
+    # Catch any other specific Streamlit secrets errors to prevent crashing.
+    pass
 
+# --- PATH CONFIGURATION ---
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# --- IMPORTS ---
+try:
+    from app.dashboard import render_dashboard
+except ImportError:
+    from dashboard import render_dashboard
+
+from rag.retrieval import get_vector_store, search_docs, build_context, format_source_line
+from rag.prompting import (
+    get_llm,
+    generate_answer,
+    contextualize_question,
+    looks_like_prompt_injection,
+    IDK_RESPONSE,
+)
+
+# --- PAGE SETUP ---
 st.set_page_config(page_title="UK Car Insurance Assistant", layout="wide")
 
 
 @st.cache_resource
 def load_resources():
-    """Cache LLM and Vector Store to prevent reloading on every interaction."""
     llm_instance = get_llm()
     vector_store_instance = get_vector_store()
     return llm_instance, vector_store_instance
 
 
-# --- STATE MANAGEMENT ---
+# --- SESSION STATE INITIALIZATION ---
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role": "assistant", "content": "Ask me anything about UK private car insurance policy wording."}
@@ -38,8 +65,12 @@ if "metrics" not in st.session_state:
         "queries": [],
         "latencies": [],
         "tokens_generated": [],
-        "feedback_score": 0
+        "feedback_score": 0,
     }
+
+# Track which messages have already received feedback
+if "feedback_given" not in st.session_state:
+    st.session_state.feedback_given = set()
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -50,27 +81,26 @@ with st.sidebar:
             {"role": "assistant", "content": "Ask me anything about UK private car insurance policy wording."}
         ]
         st.session_state.chat_history = []
+        st.session_state.feedback_given = set()  # Reset feedback tracking
         st.rerun()
 
     st.divider()
     st.subheader("Preferences")
     show_sources = st.toggle("Show Source Citations", value=True)
     st.divider()
-    st.caption("Features: Memory | Guardrails | Observability")
+    st.caption("Powered by OpenAI + FAISS")
 
-# --- TABS LAYOUT ---
+# --- MAIN TABS ---
 tab_chat, tab_dashboard = st.tabs(["💬 Chat", "📊 Observability Dashboard"])
 
-# --- TAB 1: MAIN CHAT INTERFACE ---
 with tab_chat:
     st.title("UK Private Car Insurance Assistant")
 
-    # 1. RENDER HISTORY
+    # 1. Render History
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-            # Render citations (if available and NOT empty)
             if "sources" in msg and show_sources and msg["sources"]:
                 with st.expander(f"📚 References ({len(msg['sources'])})"):
                     for idx, doc in enumerate(msg["sources"], start=1):
@@ -81,129 +111,106 @@ with tab_chat:
                         st.caption(content)
                         st.divider()
 
-    # 2. STATE MACHINE LOGIC
-    # We check the LAST message to decide if we are "Thinking" or "Ready"
-    last_msg = st.session_state.messages[-1]
+    # 2. Handle Feedback Buttons (Only if there is history)
+    if len(st.session_state.messages) > 1:
+        # Use the length of messages as a unique ID for the current interaction
+        msg_id = len(st.session_state.messages)
 
-    if last_msg["role"] == "user":
-        # --- PROCESSING STATE (Input Hidden) ---
-        # The last message was from the user, so we MUST generate an answer now.
+        # Check if feedback has already been given for this specific interaction
+        if msg_id not in st.session_state.feedback_given:
+            col1, col2, _ = st.columns([1, 1, 10])
+            with col1:
+                if st.button("👍", key=f"up_{msg_id}"):
+                    st.session_state.metrics["feedback_score"] += 1
+                    st.session_state.feedback_given.add(msg_id)
+                    st.toast("Feedback recorded!", icon="👍")
+                    st.rerun()
+            with col2:
+                if st.button("👎", key=f"down_{msg_id}"):
+                    st.session_state.metrics["feedback_score"] -= 1
+                    st.session_state.feedback_given.add(msg_id)
+                    st.toast("Thanks for the feedback.", icon="👎")
+                    st.rerun()
+        else:
+            # Optional: Show a disabled state or a "Thank you" message
+            st.caption("✅ Feedback submitted for this response.")
+
+    # 3. Handle User Input
+    user_q = st.chat_input("Type your question (e.g. 'Is theft covered?')")
+
+    if user_q:
+        st.session_state.messages.append({"role": "user", "content": user_q})
+
+        with st.chat_message("user"):
+            st.write(user_q)
 
         with st.chat_message("assistant"):
             final_text = ""
             valid_docs = []
             source_data = []
 
-            with st.spinner("Thinking..."):
-                start_time = time.time()
-                user_q = last_msg["content"]
+            start_time = time.time()
 
-                llm, vector_store = load_resources()
+            with st.spinner("Analyzing policy documents..."):
+                try:
+                    llm, vector_store = load_resources()
 
-                # Guardrails (Input)
-                if looks_like_prompt_injection(user_q):
-                    final_text = "I cannot fulfill that request. Please stick to questions about insurance policies."
-                else:
-                    # Memory
-                    if st.session_state.chat_history:
-                        search_query = contextualize_question(llm, st.session_state.chat_history, user_q)
+                    if looks_like_prompt_injection(user_q):
+                        final_text = "I cannot fulfill that request. Please stick to questions about insurance policies."
                     else:
-                        search_query = user_q
+                        if st.session_state.chat_history:
+                            search_query = contextualize_question(llm, st.session_state.chat_history, user_q)
+                        else:
+                            search_query = user_q
 
-                    # Retrieval
-                    valid_docs = search_docs(vector_store, search_query)
-                    context_text = build_context(valid_docs)
+                        valid_docs = search_docs(vector_store, search_query)
+                        context_text = build_context(valid_docs)
 
-                    # Guardrails (Context)
-                    MIN_VALID_CHUNKS = 1
-                    if len(valid_docs) < MIN_VALID_CHUNKS or looks_like_prompt_injection(context_text):
-                        final_text = IDK_RESPONSE
-                    else:
-                        # Generation
-                        final_text = generate_answer(llm, search_query, context_text)
+                        if len(valid_docs) < 1 or looks_like_prompt_injection(context_text):
+                            final_text = IDK_RESPONSE
+                            valid_docs = []
+                        else:
+                            final_text = generate_answer(llm, search_query, context_text)
 
-            # --- CRITICAL FIX: STRIP CITATIONS IF "I DON'T KNOW" ---
-            # If the LLM output contains the IDK phrase, we force-clear the citations.
-            # We use 'in' to be safe against slight variations.
-            if IDK_RESPONSE in final_text:
-                final_text = IDK_RESPONSE
-                valid_docs = []  # Clear docs so they don't show up in sources
-            # -------------------------------------------------------
+                except Exception as e:
+                    final_text = f"An error occurred: {str(e)}"
+                    valid_docs = []
+                    st.error(final_text)
 
-            # Metrics Calculation
-            end_time = time.time()
-            latency = end_time - start_time
-            tokens = len(final_text) / 4
+            latency = time.time() - start_time
+            tokens = int(len(final_text) / 4)
 
             st.session_state.metrics["queries"].append(user_q)
             st.session_state.metrics["latencies"].append(latency)
             st.session_state.metrics["tokens_generated"].append(tokens)
 
-            # Output Answer
             st.write(final_text)
 
-            # Process Sources (Only if we found valid docs AND it's not an IDK response)
             if valid_docs and final_text != IDK_RESPONSE:
                 for doc in valid_docs:
                     filename, page = format_source_line(doc)
-                    source_data.append({
-                        "source": filename,
-                        "page": page,
-                        "content": doc.page_content
-                    })
+                    source_data.append(
+                        {"source": filename, "page": page, "content": doc.page_content}
+                    )
 
-                # Show sources immediately
                 if show_sources:
                     with st.expander(f"📚 References ({len(source_data)})"):
                         for i, data in enumerate(source_data, start=1):
                             st.markdown(f"**[{i}] {data['source']}** (Page {data['page']})")
-                            st.caption(data['content'])
+                            st.caption(data["content"])
                             st.divider()
 
-            # Save Assistant Message to State
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": final_text,
-                "sources": source_data  # This will be empty if IDK
-            })
+            st.session_state.messages.append(
+                {"role": "assistant", "content": final_text, "sources": source_data}
+            )
 
-            # Update Memory Chain
-            st.session_state.chat_history.extend([
-                HumanMessage(content=user_q),
-                AIMessage(content=final_text)
-            ])
+            st.session_state.chat_history.extend(
+                [HumanMessage(content=user_q), AIMessage(content=final_text)]
+            )
             if len(st.session_state.chat_history) > 6:
                 st.session_state.chat_history = st.session_state.chat_history[-6:]
 
-            # FORCE RERUN to switch state back to "Ready"
             st.rerun()
 
-    else:
-        # --- READY STATE (Input Visible) ---
-        # The bot is done. Show feedback buttons and the input box.
-
-        # 1. Show Feedback Buttons for the answer above (Optional)
-        # We only show this if there is at least 1 Q&A pair
-        if len(st.session_state.messages) > 1:
-            col1, col2, _ = st.columns([1, 1, 10])
-            with col1:
-                if st.button("👍", key=f"up_{len(st.session_state.messages)}"):
-                    st.session_state.metrics["feedback_score"] += 1
-                    st.toast("Feedback recorded!", icon="👍")
-            with col2:
-                if st.button("👎", key=f"down_{len(st.session_state.messages)}"):
-                    st.session_state.metrics["feedback_score"] -= 1
-                    st.toast("Thanks for the feedback.", icon="👎")
-
-        # 2. Show Chat Input
-        user_q = st.chat_input("Type your question (e.g. 'Is theft covered?')")
-
-        if user_q and user_q.strip():
-            # Append to state and RERUN immediately.
-            # This triggers the "Processing State" block above.
-            st.session_state.messages.append({"role": "user", "content": user_q})
-            st.rerun()
-
-# --- TAB 2: OBSERVABILITY DASHBOARD ---
 with tab_dashboard:
     render_dashboard()

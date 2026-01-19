@@ -1,129 +1,93 @@
 import os
 import re
+import sys
+from pathlib import Path
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings
-from pinecone import Pinecone
-from langchain_pinecone import PineconeVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
 
-load_dotenv()
+# --- 1. SETUP & PATHS ---
+# We use pathlib for robust path handling
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+ENV_PATH = PROJECT_ROOT / ".env"
 
-PDF_DIR = "documents"
-INDEX_NAME = "ragchatbot"
-NAMESPACE = "policies_uk_car_v1"
+load_dotenv(ENV_PATH)
 
-embeddings = OllamaEmbeddings(model="mxbai-embed-large")
+# Verify API Key is loaded
+if not os.getenv("OPENAI_API_KEY"):
+    print(f"ERROR: OPENAI_API_KEY not found in {ENV_PATH}")
+    sys.exit(1)
 
-pc = Pinecone()
-index = pc.Index(INDEX_NAME)
+PDF_DIR = os.getenv("PDF_DIR", PROJECT_ROOT / "documents")
+FAISS_INDEX_PATH = PROJECT_ROOT / "faiss_index"
 
-vector_store = PineconeVectorStore(
-    embedding=embeddings,
-    index=index,
-    namespace=NAMESPACE
-)
+# OpenAI's text-embedding-3-small is standard now (1536 dimensions)
+OPENAI_EMBED_MODEL = "text-embedding-3-small"
 
 
 def clean_text(text: str) -> str:
-    """Normalizes text by removing excessive whitespace, newlines, and non-printable characters."""
+    """Helper to remove excessive whitespace from PDF extraction."""
     if not text:
         return ""
-    text = re.sub(r'[\n\t\r]+', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r"[\n\t\r]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-def load_pdfs(pdf_dir: str):
-    """Iterates through the directory, loads PDF files, and applies the cleaning function to every page."""
+def load_pdfs(pdf_dir: Path):
     docs = []
-    if not os.path.exists(pdf_dir):
+    if not pdf_dir.exists():
         raise FileNotFoundError(f"Directory '{pdf_dir}' does not exist.")
 
-    pdfs = sorted([n for n in os.listdir(pdf_dir) if n.lower().endswith(".pdf")])
+    # Find all PDFs in the directory
+    pdfs = sorted([f for f in os.listdir(pdf_dir) if f.lower().endswith(".pdf")])
+    print(f"Found {len(pdfs)} PDFs in {pdf_dir}")
 
     for name in pdfs:
-        path = os.path.join(pdf_dir, name)
+        file_path = pdf_dir / name
         try:
-            loader = PyPDFLoader(path)
+            loader = PyPDFLoader(str(file_path))
             loaded_docs = loader.load()
-
             for doc in loaded_docs:
                 doc.page_content = clean_text(doc.page_content)
-
+                doc.metadata["source"] = name
             docs.extend(loaded_docs)
-            print(f"OK & Cleaned: {name}")
+            print(f"OK: {name} ({len(loaded_docs)} pages)")
         except Exception as e:
-            print(f"FAIL: {name} -> {type(e).__name__}: {e}")
-            continue
+            print(f"FAIL: {name} -> {e}")
 
     return docs
 
 
-print("--- Starting Ingestion Pipeline ---")
-raw_docs = load_pdfs(PDF_DIR)
+if __name__ == "__main__":
+    print(f"--- 1. Loading PDFs from {PDF_DIR} ---")
+    raw_docs = load_pdfs(Path(PDF_DIR))
 
-if not raw_docs:
-    raise RuntimeError(f"No PDF pages loaded from '{PDF_DIR}'. Check the folder path and PDFs.")
+    if not raw_docs:
+        print("No documents found. Exiting.")
+        sys.exit(0)
 
-# Assign metadata to all documents for filtering
-for d in raw_docs:
-    d.metadata["country"] = "uk"
-    d.metadata["product"] = "private_car"
-    d.metadata["dataset"] = "uk_private_car_policy_wordings_v1"
+    print(f"--- 2. Splitting {len(raw_docs)} pages ---")
+    # OpenAI models have a larger context window, so we can slightly increase chunk size
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+    )
+    chunks = splitter.split_documents(raw_docs)
+    print(f"Created {len(chunks)} chunks.")
 
-# Split documents into smaller chunks for embedding
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200,
-)
+    print(f"--- 3. Creating Vector Store with {OPENAI_EMBED_MODEL} ---")
 
-chunks = splitter.split_documents(raw_docs)
+    embeddings = OpenAIEmbeddings(
+        model=OPENAI_EMBED_MODEL
+    )
 
-# Filter out chunks that are too short or truncate those that are too long
-MAX_CHARS = 2000
-MIN_CHARS = 50
-
-safe_chunks = []
-skipped_short = 0
-truncated = 0
-
-for c in chunks:
-    text = c.page_content or ""
-    if len(text) < MIN_CHARS:
-        skipped_short += 1
-        continue
-    if len(text) > MAX_CHARS:
-        c.page_content = text[:MAX_CHARS]
-        truncated += 1
-    safe_chunks.append(c)
-
-print(f"Chunks total={len(chunks)} | safe={len(safe_chunks)} | truncated={truncated} | skipped_short={skipped_short}")
-
-# Upload chunks to the vector store in batches, retrying individually if a batch fails
-BATCH_SIZE = 32
-skipped_embed = 0
-
-print("--- Uploading to Vector Store ---")
-for i in range(0, len(safe_chunks), BATCH_SIZE):
-    batch = safe_chunks[i:i + BATCH_SIZE]
     try:
-        vector_store.add_documents(batch)
-        print(f"Upserted batch {i // BATCH_SIZE + 1} ({i}..{i + len(batch) - 1})")
+        vector_store = FAISS.from_documents(chunks, embeddings)
+        vector_store.save_local(str(FAISS_INDEX_PATH))
+        print(f"SUCCESS: Index saved to '{FAISS_INDEX_PATH}'")
     except Exception as e:
-        print(f"Batch failed at {i}..{i + len(batch) - 1} -> {type(e).__name__}: {e}")
-        for doc in batch:
-            try:
-                vector_store.add_documents([doc])
-            except Exception as e2:
-                skipped_embed += 1
-                meta = doc.metadata
-                print(
-                    f"SKIP chunk -> {type(e2).__name__}: {e2} | "
-                    f"source={meta.get('source')} page={meta.get('page')}"
-                )
-
-print(
-    f"DONE. Pages={len(raw_docs)} | chunks_created={len(chunks)} | chunks_ingested~={len(safe_chunks) - skipped_embed} "
-    f"| skipped_embed={skipped_embed}"
-)
+        print(f"ERROR: Could not create/save index. {e}")
